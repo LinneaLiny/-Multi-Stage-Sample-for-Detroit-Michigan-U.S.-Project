@@ -1,0 +1,174 @@
+---
+title: "745 project"
+author: "LM"
+date: "2026-04-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(tidycensus)
+library(tidyverse)
+library(sampling)
+
+set.seed(114514) 
+
+# Step 1: Set Seed and API Key(我有了，你得再申请一个api,我的是2afd742342d01b979f930163e3a58d4b4695f436)
+set.seed(-77) 
+readRenviron("~/.Renviron")
+
+# Step 2: Load Detroit Tract FIPS
+TractFIPS <- read.csv("Census Tract FIPS Code Detroit MI_Updated.csv", 
+                      col.names = c("GEOID"), 
+                      colClasses = "character")
+
+```
+#Data Acquisition and Cleansing
+```{r}
+bg_data_raw <- get_decennial(
+  geography = "block group",
+  table = "P12", # 性别与年龄表
+  year = 2020,
+  sumfile = "dhc",
+  state = "MI",
+  county = "Wayne",
+  output = "wide"
+)
+
+# 
+# 将 12 位的 BG GEOID 转换为 11 位的 Tract GEOID 以便匹配
+detroit_frame <- bg_data_raw %>%
+  mutate(Tract_GEOID = substr(GEOID, 1, 11)) %>%
+  # 仅保留在上传的 CSV 文件中出现的底特律 Tract
+  inner_join(TractFIPS, by = c("Tract_GEOID" = "GEOID"))
+```
+#Age-Group Variables
+```{r}
+detroit_frame <- detroit_frame %>%
+  mutate(
+
+    age_18_34 = (P12_007N + P12_008N + P12_009N + P12_010N + P12_011N + P12_012N) + 
+                (P12_031N + P12_032N + P12_033N + P12_034N + P12_035N + P12_036N),
+
+    age_35_49 = (P12_013N + P12_014N + P12_015N) + 
+                (P12_037N + P12_038N + P12_039N),
+
+    age_50_64 = (P12_016N + P12_017N + P12_018N + P12_019N) + 
+                (P12_040N + P12_041N + P12_042N + P12_043N),
+
+    age_65_plus = (P12_020N + P12_021N + P12_022N + P12_023N + P12_024N + P12_025N) + 
+                  (P12_044N + P12_045N + P12_046N + P12_047N + P12_048N + P12_049N)
+  ) %>%
+  select(GEOID, Tract_GEOID, TotalPop = P12_001N, starts_with("age_"))
+
+```
+#Statistics & Flagging
+```{r}
+
+tract_stats <- detroit_frame %>%
+  group_by(Tract_GEOID) %>%
+  summarise(bg_per_tract = n())
+
+final_frame <- detroit_frame %>%
+  left_join(tract_stats, by = "Tract_GEOID") %>%
+  mutate(
+    #如果一个 Tract 只有一个 BG，抽样时会有风险
+    flag_single_bg = ifelse(bg_per_tract < 2, 1, 0),
+    #标记人口过少的 Block Group (例如总人口 < 50)
+    flag_low_pop = ifelse(TotalPop < 50, 1, 0)
+  ) %>%
+  arrange(Tract_GEOID) # 按普查区排序，准备后续抽样
+
+print(head(final_frame))
+```
+
+#AI
+```{r}
+
+
+# 1. 汇总 Tract 级别数据
+tract_level_frame <- final_frame %>%
+  group_by(Tract_GEOID) %>%
+  summarise(Tract_MOS = sum(TotalPop)) %>%
+  ungroup() %>%
+  # 计算每个 Tract 的包含概率 (Inclusion Probability)
+  mutate(prob_stage1 = inclusionprobabilities(Tract_MOS, 40))
+
+# 2. 使用系统 PPS 抽样 (Systematic PPS) 抽取 40 个 Tract
+set.seed(-77) # 确保每次运行结果一致
+select_tract_idx <- UPsystematic(tract_level_frame$prob_stage1)
+selected_tracts <- tract_level_frame[select_tract_idx == 1, ]
+
+# --- Step 6: 第二阶段抽样 (在每个选中的 Tract 中选 1 个 BG 作为 SSU) ---
+
+final_sample <- final_frame %>%
+  # 只保留第一阶段选中的 Tracts
+  filter(Tract_GEOID %in% selected_tracts$Tract_GEOID) %>%
+  group_by(Tract_GEOID) %>%
+  # 在每个 Tract 内部，按 BG 的人口比例随机抽取 1 个 BG
+  slice_sample(n = 1, weight_by = TotalPop) %>%
+  ungroup() %>%
+  # 计算第二阶段条件概率：BG_Pop / Tract_Pop
+  left_join(tract_level_frame %>% select(Tract_GEOID, Tract_MOS, prob_stage1), by = "Tract_GEOID") %>%
+  mutate(prob_stage2 = TotalPop / Tract_MOS,
+         final_prob = prob_stage1 * prob_stage2,  # 总选择概率
+         sampling_weight = 1 / final_prob)        # 设计权重
+
+# 验证抽样结果：应该是 40 行
+print(paste("抽取的 Block Groups 数量:", nrow(final_sample)))
+
+```
+
+
+```{r}
+# --- Step 7: 可视化 (Leaflet 交互地图) ---
+library(leaflet)
+library(sf)
+
+# 1. 获取底特律 Block Groups 的形状文件 (使用 tigris 包)
+# 注意：tigris 默认下载的是整个 Wayne County，我们需要过滤
+detroit_shapes <- tigris::block_groups(state = "MI", county = "Wayne", cb = TRUE, year = 2020) %>%
+  st_transform(crs = 4326) # 转换为经纬度坐标系用于 Leaflet
+
+# 2. 将抽样数据合并到地图形状中
+map_data <- detroit_shapes %>%
+  inner_join(final_sample, by = c("GEOID" = "GEOID"))
+
+# 3. 绘制地图
+leaflet(map_data) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor = "orange",
+    weight = 2,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 5, color = "#666", bringToFront = TRUE),
+    popup = ~paste0("<b>Tract: </b>", Tract_GEOID, "<br>",
+                    "<b>BG: </b>", GEOID, "<br>",
+                    "<b>Total Pop: </b>", TotalPop, "<br>",
+                    "<b>Prob: </b>", round(final_prob, 5))
+  ) %>%
+  addControl("Detroit 745 Project: 40 Sampled BGs", position = "topright")
+
+```
+
+```{r}
+# --- Step 8: 目标样本量与响应率计算 ---
+target_stats <- data.frame(
+  age_group = c("18-34", "35-49", "50-64", "65+"),
+  target_n = c(250, 250, 250, 250),
+  expected_rr = c(0.35, 0.45, 0.50, 0.65)
+) %>%
+  mutate(required_contacts = target_n / expected_rr)
+
+knitr::kable(target_stats, caption = "Required Sample Size Based on Response Rates")
+
+```
+
+
+
