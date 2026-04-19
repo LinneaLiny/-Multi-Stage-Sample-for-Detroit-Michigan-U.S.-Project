@@ -1,0 +1,869 @@
+---
+title: "745 Project: Detroit Multi-Stage Sampling (3-Stage PPS Final)"
+author: "XINYU LIN"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+# =================================================================
+# FINAL DESIGN — 3-stage with PPS BG selection
+#
+# Both goals achieved EXACTLY [Lecture Slides 34-35]:
+#
+# Stage 1: Select m=40 PSUs (tracts) by PPS systematic
+#   pi_1 = m * S_i / S+
+#   S_i = sum_d f_d * Q_i(d)  [PSU composite MOS, HH residents]
+#
+# Stage 2: Select 1 BG per PSU by PPS systematic
+#   pi_{2|i} = S_ij / S_i
+#   S_ij = sum_d f_d * Q_ij(d)  [BG composite MOS, HH residents]
+#   Small/zero BGs linked before selection (same feasibility logic)
+#
+# Stage 3: Person sampling within selected BG
+#   pi_{3|ij}(d) = n_bar * f_d / S_ij
+#   1 adult per HH (last-birthday); HH rate q_ij = n_bar / TotHH_ij
+#
+# SELF-WEIGHTING [EXACT, Slide 35]:
+#   pi_1 * pi_{2|i} * pi_{3|ij}(d)
+#   = (m*S_i/S+) * (S_ij/S_i) * (n_bar*f_d/S_ij)
+#   = m*n_bar*f_d / S+ = f_d      [S_i and S_ij both cancel]
+#
+# EQUAL WORKLOAD [EXACT per selected BG, Slide 34]:
+#   sum_d n*_ij(d) = sum_d Q_ij(d) * (n_bar*f_d/S_ij)
+#                 = n_bar * S_ij / S_ij = n_bar
+#   Since 1 BG selected per PSU, BG workload = PSU workload = n_bar
+#
+# GQ HANDLING:
+#   N_i(d) and N_ij(d) count only HH residents (TotHH>0 BGs).
+#   GQ BGs excluded from sampling frame entirely.
+# =================================================================
+
+library(readxl); library(readr);  library(dplyr)
+library(stringr); library(tidyr); library(sampling); library(tibble)
+```
+
+## 1. Read Data
+
+```{r read-data}
+xlsx_url <- paste0(
+  "https://raw.githubusercontent.com/LinneaLiny/",
+  "-Multi-Stage-Sample-for-Detroit-Michigan-U.S.-Project/main/",
+  "Detroit%20MI_Updated.xlsx")
+fips_url <- paste0(
+  "https://raw.githubusercontent.com/LinneaLiny/-Multi-Stage-Sample-",
+  "for-Detroit-Michigan-U.S.-Project/main/",
+  "Census%20Tract%20FIPS%20Code%20Detroit%20MI_Updated.csv")
+
+tmp_xlsx <- tempfile(fileext = ".xlsx")
+tmp_csv  <- tempfile(fileext = ".csv")
+download.file(xlsx_url, tmp_xlsx, mode = "wb", quiet = TRUE)
+download.file(fips_url, tmp_csv,  mode = "wb", quiet = TRUE)
+
+tract_raw  <- read_excel(tmp_xlsx, sheet = "Tract")
+bg_raw     <- read_excel(tmp_xlsx, sheet = "BlockGroup")
+tract_fips <- read_csv(tmp_csv, show_col_types = FALSE) %>%
+  rename(GEOID = 1) %>% mutate(GEOID = as.character(GEOID))
+
+cat("Detroit tracts:", nrow(tract_fips), "\n")
+```
+
+## 2. Cleaning
+
+```{r cleaning}
+tract <- tract_raw %>%
+  mutate(Tract = as.character(Tract), tract_id = Tract) %>%
+  filter(tract_id %in% tract_fips$GEOID)
+
+bg <- bg_raw %>%
+  mutate(BlockGroup = as.character(BlockGroup),
+         tract_id   = str_sub(BlockGroup, 1, 11),
+         bg_id      = BlockGroup) %>%
+  filter(tract_id %in% tract_fips$GEOID)
+```
+
+## 3. Age-Group Counts
+
+```{r age-groups}
+make_age_groups <- function(df) {
+  df %>% mutate(
+    age18_34 =
+      Male18to19Yrs+Male20Yrs+Male21Yrs+Male22to24Yrs+
+      Male25to29Yrs+Male30to34Yrs+Female18to19Yrs+Female20Yrs+
+      Female21Yrs+Female22to24Yrs+Female25to29Yrs+Female30to34Yrs,
+    age35_49 =
+      Male35to39Yrs+Male40to44Yrs+Male45to49Yrs+
+      Female35to39Yrs+Female40to44Yrs+Female45to49Yrs,
+    age50_64 =
+      Male50to54Yrs+Male55to59Yrs+Male60to61Yrs+Male62to64Yrs+
+      Female50to54Yrs+Female55to59Yrs+Female60to61Yrs+Female62to64Yrs,
+    age65plus =
+      Male65to66Yrs+Male67to69Yrs+Male70to74Yrs+Male75to79Yrs+
+      Male80to84Yrs+MaleGE85Yrs+Female65to66Yrs+Female67to69Yrs+
+      Female70to74Yrs+Female75to79Yrs+Female80to84Yrs+FemaleGE85Yrs,
+    age18plus = age18_34+age35_49+age50_64+age65plus)
+}
+tract <- make_age_groups(tract)
+bg    <- make_age_groups(bg)
+```
+
+## 4. Build Frames — HH Residents Only
+
+```{r frames}
+# Separate HH-BGs (TotHH>0) from GQ-BGs (TotHH=0, age18plus>0).
+# Only HH-BGs enter the sampling frame and contribute to MOS.
+# GQ residents cannot be reached via household listing.
+
+bg_frame <- bg %>%
+  transmute(bg_id, tract_id, NAME, TotHH, TotPerson,
+            age18_34, age35_49, age50_64, age65plus, age18plus) %>%
+  mutate(is_gq  = (TotHH == 0 & age18plus > 0),
+         has_hh = (TotHH > 0))
+
+cat("Total BGs:", nrow(bg_frame), "\n")
+cat("HH BGs (TotHH>0):", sum(bg_frame$has_hh), "\n")
+cat("GQ BGs (TotHH=0, age18plus>0):", sum(bg_frame$is_gq), "\n\n")
+
+# HH-BG frame: the sampling frame for both PSU and BG stages
+bg_hh <- bg_frame %>% filter(has_hh)
+
+# Aggregate HH-resident counts to tract level for PSU MOS
+tract_hh <- bg_hh %>%
+  group_by(tract_id) %>%
+  summarise(
+    n_bg_hh      = n(),
+    TotHH_tract  = sum(TotHH),
+    age18_34_hh  = sum(age18_34),
+    age35_49_hh  = sum(age35_49),
+    age50_64_hh  = sum(age50_64),
+    age65plus_hh = sum(age65plus),
+    age18plus_hh = sum(age18plus),
+    .groups = "drop")
+
+tract_frame <- tract %>%
+  transmute(tract_id, NAME, TotHH, TotPerson,
+            age18_34, age35_49, age50_64, age65plus, age18plus) %>%
+  left_join(tract_hh, by = "tract_id") %>%
+  mutate(across(c(n_bg_hh, TotHH_tract,
+                  age18_34_hh, age35_49_hh, age50_64_hh,
+                  age65plus_hh, age18plus_hh),
+                ~replace_na(., 0))) %>%
+  arrange(tract_id)   # GEOID sort FIRST, before linkage
+
+cat("=== HH residents per tract (age18plus_hh) ===\n")
+summary(tract_frame$age18plus_hh)
+cat("\n=== HH-BGs per tract ===\n")
+print(table(tract_frame$n_bg_hh))
+```
+
+## 5. Design Parameters
+
+```{r design-params}
+n_psu <- 40
+
+target_resp <- c(age18_34=250, age35_49=250, age50_64=250, age65plus=250)
+resp_rate   <- c(age18_34=0.35, age35_49=0.45, age50_64=0.50, age65plus=0.65)
+
+target_table <- tibble(
+  age_group = names(target_resp),
+  n_resp    = as.numeric(target_resp),
+  rr        = as.numeric(resp_rate)) %>%
+  mutate(n_selected = ceiling(n_resp / rr))
+
+print(target_table)
+
+total_n <- sum(target_table$n_selected)   # S+ = 2156
+m_bar   <- total_n / n_psu                # n_bar = 53.9
+
+cat("\nS+ =", total_n, "| n_bar =", m_bar, "\n")
+```
+
+## 6. Why 1 Person per Household
+
+```{r hh-design}
+# Outcome variables are household-level or highly correlated within HH:
+#   (1) HH vehicle ownership -> IDENTICAL for all HH members (rho_HH=1)
+#   (2) Main transport mode  -> highly correlated within HH
+#   (3) Skipped trips        -> correlated within HH
+#   (4) Asked family for help-> correlated within HH
+# Selecting 2+ per HH: DEFF_HH = 1+(k-1)*rho_HH >> 1 for these vars.
+# Decision: 1 eligible adult per HH via Last-Birthday Method.
+cat("1 adult per HH. Last-Birthday selection rule.\n")
+```
+
+## 7. Same-Rate Design Discussion
+
+```{r same-rate}
+N_d <- c(
+  age18_34  = sum(tract_frame$age18_34_hh),
+  age35_49  = sum(tract_frame$age35_49_hh),
+  age50_64  = sum(tract_frame$age50_64_hh),
+  age65plus = sum(tract_frame$age65plus_hh))
+
+f_18_34  <- target_table$n_selected[target_table$age_group=="age18_34"]  / N_d["age18_34"]
+f_35_49  <- target_table$n_selected[target_table$age_group=="age35_49"]  / N_d["age35_49"]
+f_50_64  <- target_table$n_selected[target_table$age_group=="age50_64"]  / N_d["age50_64"]
+f_65plus <- target_table$n_selected[target_table$age_group=="age65plus"] / N_d["age65plus"]
+f_vals   <- c(f_18_34, f_35_49, f_50_64, f_65plus)
+max_f    <- max(f_vals)
+f_unif   <- total_n / sum(N_d)
+
+tibble(
+  age_group = names(N_d),
+  N_d_hh    = as.integer(N_d),
+  n_needed  = target_table$n_selected,
+  rr        = as.numeric(resp_rate),
+  f_d       = round(f_vals, 6),
+  resp_unif = round(f_unif * as.integer(N_d) * as.numeric(resp_rate))) %>%
+  print()
+cat("\nA uniform rate cannot achieve 250 respondents per domain.",
+    "Domain-specific rates f_d are required.\n")
+```
+
+## 8. Composite MOS for PSUs and BGs
+
+```{r composite-mos}
+# PSU MOS: S_i = sum_d f_d * Q_i(d)  using HH-resident counts
+# BG  MOS: S_ij = sum_d f_d * Q_ij(d) using HH-resident counts
+#
+# Feasibility [Slide 34]:
+#   PSU: S_i  >= n_bar * max(f_d)
+#   BG:  S_ij >= n_bar * max(f_d)  (same threshold, same formula)
+# If a BG is too small, it is linked with adjacent BGs before selection.
+
+min_feasible_MOS <- m_bar * max_f
+cat("Feasibility threshold:", round(min_feasible_MOS, 6), "\n\n")
+
+# PSU-level MOS (from HH tract aggregates)
+tract_frame <- tract_frame %>%
+  mutate(
+    MOS_comp = f_18_34*age18_34_hh + f_35_49*age35_49_hh +
+               f_50_64*age50_64_hh + f_65plus*age65plus_hh,
+    flag_zero_hh  = age18plus_hh == 0,
+    flag_lt2_bg   = n_bg_hh < 2,
+    flag_infeas   = (MOS_comp < min_feasible_MOS) & !flag_zero_hh)
+
+# BG-level MOS (HH residents only)
+bg_hh <- bg_hh %>%
+  mutate(MOS_bg = f_18_34*age18_34 + f_35_49*age35_49 +
+                  f_50_64*age50_64 + f_65plus*age65plus)
+
+cat("=== PSU composite MOS ===\n")
+summary(tract_frame$MOS_comp)
+cat("\nSum S_i = S+ (should =", total_n, "):",
+    round(sum(tract_frame$MOS_comp[!tract_frame$flag_zero_hh]), 2), "\n")
+cat("Tracts with zero HH adults:", sum(tract_frame$flag_zero_hh), "\n")
+cat("Tracts with <2 HH-BGs:", sum(tract_frame$flag_lt2_bg & !tract_frame$flag_zero_hh), "\n")
+cat("Tracts with infeasible MOS:", sum(tract_frame$flag_infeas), "\n\n")
+
+cat("=== BG composite MOS ===\n")
+summary(bg_hh$MOS_bg)
+cat("BGs with MOS < threshold:",
+    sum(bg_hh$MOS_bg < min_feasible_MOS), "\n")
+```
+
+## 9. Stage 1: PSU Linkage and Frame
+
+```{r psu-linkage}
+# Sort FIRST (Section 4), then link. Linked PSUs inherit GEOID order
+# through sort_key = min(tract_id).
+
+tract_frame <- tract_frame %>%
+  mutate(needs_link = !flag_zero_hh & (flag_infeas | flag_lt2_bg))
+
+cat("Tracts needing PSU linkage:", sum(tract_frame$needs_link), "\n\n")
+
+build_psu_map <- function(tract_df, min_MOS) {
+  regular <- tract_df %>%
+    filter(age18plus_hh > 0, !needs_link) %>%
+    transmute(tract_id, psu_id = tract_id,
+              psu_type = "single_tract", link_group = NA_integer_)
+
+  pool <- tract_df %>%
+    filter(age18plus_hh > 0, needs_link) %>%
+    arrange(tract_id) %>%
+    mutate(grp = ceiling(row_number() / 2))
+
+  if (nrow(pool) == 0) return(regular)
+
+  for (iter in seq_len(30)) {
+    grp_mos <- pool %>% group_by(grp) %>%
+      summarise(mos = sum(MOS_comp), .groups = "drop")
+    bad <- grp_mos$grp[grp_mos$mos < min_MOS]
+    if (length(bad) == 0) break
+    for (b in bad) {
+      all_g   <- sort(unique(pool$grp))
+      idx     <- which(all_g == b)
+      partner <- if (idx < length(all_g)) all_g[idx+1] else all_g[idx-1]
+      pool$grp[pool$grp == partner] <- b
+      pool$grp <- as.integer(factor(pool$grp,
+                                    levels = sort(unique(pool$grp))))
+    }
+  }
+
+  linked <- pool %>% group_by(grp) %>%
+    mutate(
+      psu_id   = paste0("LPSU_", first(tract_id), "_", last(tract_id)),
+      psu_type = case_when(n()==1~"singleton_link",
+                           n()==2~"paired_link",
+                           TRUE ~paste0(n(),"tract_link"))) %>%
+    ungroup() %>%
+    transmute(tract_id, psu_id, psu_type, link_group = grp)
+
+  bind_rows(regular, linked)
+}
+
+psu_map <- build_psu_map(tract_frame, min_feasible_MOS)
+cat("=== PSU types ===\n"); print(psu_map %>% count(psu_type))
+```
+
+```{r psu-frame}
+psu_frame <- tract_frame %>%
+  filter(age18plus_hh > 0) %>%
+  left_join(psu_map, by = "tract_id") %>%
+  group_by(psu_id, psu_type) %>%
+  summarise(
+    sort_key     = min(tract_id),
+    n_tracts     = n(),
+    n_bg_hh      = sum(n_bg_hh,      na.rm = TRUE),
+    TotHH        = sum(TotHH_tract,  na.rm = TRUE),
+    age18_34_hh  = sum(age18_34_hh,  na.rm = TRUE),
+    age35_49_hh  = sum(age35_49_hh,  na.rm = TRUE),
+    age50_64_hh  = sum(age50_64_hh,  na.rm = TRUE),
+    age65plus_hh = sum(age65plus_hh, na.rm = TRUE),
+    age18plus_hh = sum(age18plus_hh, na.rm = TRUE),
+    age18_34     = sum(age18_34,     na.rm = TRUE),
+    age35_49     = sum(age35_49,     na.rm = TRUE),
+    age50_64     = sum(age50_64,     na.rm = TRUE),
+    age65plus    = sum(age65plus,    na.rm = TRUE),
+    MOS_psu      = sum(MOS_comp,     na.rm = TRUE),
+    .groups = "drop") %>%
+  arrange(sort_key)   # geographic order via first constituent GEOID
+
+cat("Total PSUs:", nrow(psu_frame), "\n")
+cat("Sum MOS_psu = S+ (should =", total_n, "):",
+    round(sum(psu_frame$MOS_psu), 2), "\n")
+
+n_bad <- sum(psu_frame$MOS_psu < min_feasible_MOS)
+if (n_bad > 0) {
+  cat("INFEASIBLE PSUs:\n")
+  print(psu_frame %>% filter(MOS_psu < min_feasible_MOS) %>%
+          dplyr::select(psu_id, psu_type, n_bg_hh, age18plus_hh, MOS_psu))
+  stop("Linkage incomplete.")
+}
+cat("PSU feasibility check PASSED.\n")
+cat("\n=== PSU MOS ===\n"); summary(psu_frame$MOS_psu)
+cat("\n=== PSU types ===\n"); print(table(psu_frame$psu_type))
+```
+
+## 10. Stage 1: PPS Systematic Sampling of PSUs
+
+```{r stage1}
+set.seed(-77)
+
+pik_psu <- inclusionprobabilities(psu_frame$MOS_psu, n = n_psu)
+s_psu   <- UPsystematic(pik_psu)
+
+psu_frame <- psu_frame %>%
+  mutate(pik_psu = pik_psu, selected_psu = as.logical(s_psu))
+
+psu_sample <- psu_frame %>% filter(selected_psu)
+
+cat("PSUs selected:", nrow(psu_sample), "\n")
+cat("sum(pik_psu) =", round(sum(pik_psu),4), "(should =", n_psu, ")\n\n")
+cat("=== MOS of selected PSUs ===\n"); summary(psu_sample$MOS_psu)
+cat("\n=== pi_1 of selected PSUs ===\n"); summary(psu_sample$pik_psu)
+cat("\n=== Types ===\n"); print(table(psu_sample$psu_type))
+```
+
+## 11. Stage 2: BG Linkage and PPS Systematic Sampling
+
+```{r bg-stage}
+# Within each selected PSU, select 1 BG by PPS systematic using S_ij.
+# Before selection, BGs too small (S_ij < threshold) are linked with
+# adjacent BGs within the same PSU (GEOID order within PSU).
+#
+# pi_{2|i} = S_ij / S_i   =>  pi_{2|i} * S_i = S_ij
+#
+# This gives the key cancellation:
+#   pi_1 * pi_{2|i} * pi_{3|ij}(d)
+#   = (m*S_i/S+) * (S_ij/S_i) * (n_bar*f_d/S_ij) = f_d  EXACT
+
+selected_tract_ids <- psu_map %>%
+  filter(psu_id %in% psu_sample$psu_id) %>%
+  pull(tract_id)
+
+# BG frame for selected PSUs (HH-BGs only, sorted by GEOID within PSU)
+bg_in_sample <- bg_hh %>%
+  filter(tract_id %in% selected_tract_ids) %>%
+  left_join(psu_map %>% dplyr::select(tract_id, psu_id), by = "tract_id") %>%
+  left_join(psu_frame %>% dplyr::select(psu_id, MOS_psu), by = "psu_id") %>%
+  arrange(psu_id, bg_id)   # GEOID sort within PSU before linkage
+
+cat("HH-BGs in sampled PSUs:", nrow(bg_in_sample), "\n")
+cat("BGs with MOS_bg < threshold:",
+    sum(bg_in_sample$MOS_bg < min_feasible_MOS), "\n\n")
+
+# BG linkage within each PSU (same iterative logic as PSU linkage)
+build_bg_map <- function(bg_df, min_MOS) {
+  bg_df %>%
+    group_by(psu_id) %>%
+    group_modify(function(df, key) {
+      df <- df %>% arrange(bg_id) %>% mutate(grp = row_number())
+
+      # Mark BGs needing linkage
+      df <- df %>% mutate(needs_link_bg = MOS_bg < min_MOS | age18plus == 0)
+
+      # Iterative linkage within PSU
+      pool_idx <- which(df$needs_link_bg)
+      if (length(pool_idx) == 0) {
+        return(df %>% mutate(bg_oper_id = bg_id, bg_oper_type = "single_bg"))
+      }
+
+      # Simple approach: pair small BGs with next BG in GEOID order
+      assigned <- rep(NA_integer_, nrow(df))
+      grp_id   <- 1L
+      i <- 1L
+      while (i <= nrow(df)) {
+        if (df$needs_link_bg[i]) {
+          # Pair with next row
+          j <- i + 1L
+          if (j <= nrow(df)) {
+            assigned[i] <- grp_id; assigned[j] <- grp_id
+            i <- j + 1L
+          } else {
+            # Last row, pair with previous
+            assigned[i] <- grp_id - 1L
+            i <- i + 1L
+          }
+        } else {
+          assigned[i] <- grp_id
+          i <- i + 1L
+        }
+        grp_id <- grp_id + 1L
+      }
+      assigned[is.na(assigned)] <- max(assigned, na.rm=TRUE) + 1L
+
+      df %>%
+        mutate(
+          bg_grp = assigned,
+          bg_oper_id = ave(bg_id, bg_grp, FUN=function(x)
+            if(length(x)==1) x[1] else paste0("LBG_",x[1],"_",x[length(x)])),
+          bg_oper_type = ave(bg_id, bg_grp, FUN=function(x)
+            if(length(x)==1) "single_bg" else "linked_bg"))
+    }) %>%
+    ungroup()
+}
+
+bg_in_sample_linked <- build_bg_map(bg_in_sample, min_feasible_MOS)
+
+# Aggregate to operational BG level
+bg_oper_frame <- bg_in_sample_linked %>%
+  group_by(psu_id, MOS_psu, bg_oper_id, bg_oper_type) %>%
+  summarise(
+    n_bg_combined = n(),
+    TotHH         = sum(TotHH),
+    age18_34      = sum(age18_34),
+    age35_49      = sum(age35_49),
+    age50_64      = sum(age50_64),
+    age65plus     = sum(age65plus),
+    age18plus     = sum(age18plus),
+    MOS_bg_oper   = sum(MOS_bg),   # S_ij for this operational BG
+    .groups = "drop") %>%
+  arrange(psu_id, bg_oper_id)
+
+cat("Operational BGs in sampled PSUs:", nrow(bg_oper_frame), "\n")
+cat("BGs still infeasible after linkage:",
+    sum(bg_oper_frame$MOS_bg_oper < min_feasible_MOS), "\n\n")
+cat("=== BG MOS after linkage ===\n")
+summary(bg_oper_frame$MOS_bg_oper)
+
+# PPS systematic selection: 1 operational BG per PSU
+# pi_{2|i} = S_ij / S_i  (inclusion prob proportional to BG MOS)
+set.seed(-77)
+
+bg_sample_list <- bg_oper_frame %>%
+  group_by(psu_id) %>%
+  group_map(function(df, key) {
+    n_here  <- nrow(df)
+    S_i_val <- df$MOS_psu[1]
+    if (n_here == 1) {
+      df %>% mutate(pik_bg = df$MOS_bg_oper / S_i_val,
+                    selected_bg = TRUE)
+    } else {
+      pik <- inclusionprobabilities(df$MOS_bg_oper, n = 1)
+      sel <- as.logical(UPsystematic(pik))
+      df  %>% mutate(pik_bg = pik, selected_bg = sel)
+    }
+  }, .keep = TRUE) %>%
+  bind_rows()
+
+bg_sample <- bg_sample_list %>% filter(selected_bg)
+
+cat("\nBGs selected:", nrow(bg_sample), "(should be", n_psu, ")\n")
+cat("\n=== pi_{2|i} = S_ij/S_i of selected BGs ===\n")
+summary(bg_sample$pik_bg)
+cat("\n=== MOS_bg of selected BGs (S_ij) ===\n")
+summary(bg_sample$MOS_bg_oper)
+cat("\n=== TotHH of selected BGs ===\n")
+summary(bg_sample$TotHH)
+```
+
+## 12. Stage 3: Person Sampling Rates
+
+```{r person-stage}
+# pi_{3|ij}(d) = n_bar * f_d / S_ij
+# where S_ij = MOS_bg_oper of the selected BG
+#
+# Field operation:
+#   List all HHs in selected BG.
+#   Sample HHs at composite rate q_ij = n_bar / TotHH_selected_BG.
+#   Select 1 adult per sampled HH (last-birthday method).
+
+sample_design <- bg_sample %>%
+  mutate(
+    # Person-stage rates: pi_{3|ij}(d) = n_bar * f_d / S_ij
+    p3_18_34  = m_bar * f_18_34  / MOS_bg_oper,
+    p3_35_49  = m_bar * f_35_49  / MOS_bg_oper,
+    p3_50_64  = m_bar * f_50_64  / MOS_bg_oper,
+    p3_65plus = m_bar * f_65plus / MOS_bg_oper,
+
+    # Cap at 1 (take-all for very small BGs)
+    p3_18_34_cap  = pmin(p3_18_34,  1),
+    p3_35_49_cap  = pmin(p3_35_49,  1),
+    p3_50_64_cap  = pmin(p3_50_64,  1),
+    p3_65plus_cap = pmin(p3_65plus, 1),
+
+    takeall_18_34  = p3_18_34  > 1,
+    takeall_35_49  = p3_35_49  > 1,
+    takeall_50_64  = p3_50_64  > 1,
+    takeall_65plus = p3_65plus > 1,
+
+    # HH sampling rate for field use: q_ij = n_bar / TotHH_BG
+    hh_rate = pmin(m_bar / TotHH, 1),
+
+    # Expected workload per selected BG [n_bar * S_ij / S_ij = n_bar]
+    exp_n_18_34  = age18_34  * p3_18_34_cap,
+    exp_n_35_49  = age35_49  * p3_35_49_cap,
+    exp_n_50_64  = age50_64  * p3_50_64_cap,
+    exp_n_65plus = age65plus * p3_65plus_cap,
+    exp_n_total  = exp_n_18_34 + exp_n_35_49 + exp_n_50_64 + exp_n_65plus)
+
+cat("=== Take-all check ===\n")
+cat("age18_34 :", sum(sample_design$takeall_18_34),  "BGs\n")
+cat("age35_49 :", sum(sample_design$takeall_35_49),  "BGs\n")
+cat("age50_64 :", sum(sample_design$takeall_50_64),  "BGs\n")
+cat("age65plus:", sum(sample_design$takeall_65plus), "BGs\n")
+cat("\n=== HH sampling rates (q_ij = n_bar/TotHH) ===\n")
+summary(sample_design$hh_rate)
+cat("NA count:", sum(is.na(sample_design$hh_rate)), "(should be 0)\n")
+```
+
+## 13. Verify Both Goals
+
+```{r verify}
+sample_final <- sample_design %>%
+  left_join(psu_frame %>% dplyr::select(psu_id, pik_psu),
+            by = "psu_id") %>%
+  mutate(
+    # Overall: pi_1 * pi_{2|i} * pi_{3|ij}(d) = f_d  [EXACT]
+    p_overall_18_34  = pik_psu * pik_bg * p3_18_34_cap,
+    p_overall_35_49  = pik_psu * pik_bg * p3_35_49_cap,
+    p_overall_50_64  = pik_psu * pik_bg * p3_50_64_cap,
+    p_overall_65plus = pik_psu * pik_bg * p3_65plus_cap,
+    w_base_18_34  = 1 / p_overall_18_34,
+    w_base_35_49  = 1 / p_overall_35_49,
+    w_base_50_64  = 1 / p_overall_50_64,
+    w_base_65plus = 1 / p_overall_65plus)
+
+cat("=== GOAL 1: SELF-WEIGHTING ===\n")
+cat("pi_1 * pi_{2|i} * pi_{3|ij}(d) should equal f_d exactly\n\n")
+for (ag in c("18_34","35_49","50_64","65plus")) {
+  col <- paste0("p_overall_", ag)
+  fd  <- switch(ag,"18_34"=f_18_34,"35_49"=f_35_49,
+                   "50_64"=f_50_64,"65plus"=f_65plus)
+  v   <- sample_final[[col]]
+  ok  <- max(abs(v - fd)/fd, na.rm=TRUE) < 0.001
+  cat(sprintf("  age%-6s: [%.6f, %.6f]  f_d=%.6f  %s\n",
+              ag, min(v,na.rm=T), max(v,na.rm=T), fd,
+              ifelse(ok, "✓ EXACT", "⚠ deviation")))
+}
+
+cat("\nCV of base weights (0 = perfect self-weighting):\n")
+sample_final %>%
+  summarise(
+    CV_18_34  = sd(w_base_18_34) /mean(w_base_18_34),
+    CV_35_49  = sd(w_base_35_49) /mean(w_base_35_49),
+    CV_50_64  = sd(w_base_50_64) /mean(w_base_50_64),
+    CV_65plus = sd(w_base_65plus)/mean(w_base_65plus)) %>%
+  print()
+
+cat("\n=== GOAL 2: EQUAL WORKLOAD PER SELECTED BG/PSU ===\n")
+cat("exp_n_total = sum_d Q_ij(d) * pi_{3|ij}(d) = n_bar * S_ij/S_ij = n_bar\n\n")
+summary(sample_final$exp_n_total)
+cat("Target n_bar:", m_bar, "\n")
+cat("Deviation only from take-all capping (p3>1 => workload slightly < n_bar).\n\n")
+
+cat("exp_n_total for all 40 PSUs:\n")
+sample_final %>%
+  dplyr::select(psu_id, MOS_psu, MOS_bg_oper, pik_bg, exp_n_total) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  print(n = Inf)
+```
+
+## 14. Anticipated Precision
+
+```{r precision}
+# Anticipated Precision — correct calculation
+p0   <- 0.20    # planning proportion: public transit use
+rho  <- 0.05    # assumed ICC within tracts (typical urban survey)
+
+# Overall response rate (weighted by selections needed)
+r_bar <- sum(target_table$n_resp) / sum(target_table$n_selected)
+# = 1000 / 2156 = 0.4638
+
+# Expected respondents per PSU
+n_resp_per_psu <- m_bar * r_bar    # 53.9 * 0.4638 ≈ 25.0
+n_resp_total   <- sum(target_resp) # 1000
+
+# DEFF using respondents per PSU (correct denominator)
+DEFF  <- 1 + (n_resp_per_psu - 1) * rho
+n_eff <- n_resp_total / DEFF
+SE    <- sqrt(p0 * (1 - p0) / n_eff)
+MOE   <- 1.96 * SE
+
+cat("=== Anticipated Precision ===\n")
+cat("Overall response rate (r_bar):", round(r_bar, 4), "\n")
+cat("Expected respondents per PSU:", round(n_resp_per_psu, 2), "\n")
+cat("DEFF =", round(DEFF, 3), "\n")
+cat("n_eff =", round(n_eff, 1), "\n")
+cat("SE(p_hat) =", round(SE, 4), "\n")
+cat("95% MOE =", round(MOE, 4), "(", round(MOE*100, 2), "%)\n\n")
+
+# Domain-level DEFF (each domain: 250 respondents over 40 PSUs)
+n_resp_per_psu_per_domain <- n_resp_per_psu / 4  # = 6.25
+DEFF_domain <- 1 + (n_resp_per_psu_per_domain - 1) * rho
+cat("Domain-level DEFF (per age group):", round(DEFF_domain, 3), "\n")
+cat("(For domain-specific estimates, e.g., transit use among 18-34)\n\n")
+
+# Sensitivity table
+tibble(rho = c(0.01, 0.03, 0.05, 0.10, 0.15)) %>%
+  mutate(
+    n_resp_psu = n_resp_per_psu,
+    DEFF       = 1 + (n_resp_psu - 1) * rho,
+    n_eff      = n_resp_total / DEFF,
+    SE         = sqrt(p0 * (1 - p0) / n_eff),
+    MOE_95pct  = round(1.96 * SE, 4)) %>%
+  print()
+```
+
+## 15. Variance Estimation Guidance
+
+```{r variance}
+cat("library(survey)\n")
+cat("design <- svydesign(\n")
+cat("  ids     = ~psu_id + bg_oper_id,\n")
+cat("  weights = ~w_base_d,\n")
+cat("  data    = respondent_data\n")
+cat(")\n\n")
+cat("Both stages used systematic PPS => no unbiased variance estimator.\n")
+cat("Use successive-differences estimator or WR approximation.\n")
+```
+
+## 16. Output Files
+
+```{r outputs}
+frame1 <- psu_frame %>%
+  dplyr::select(psu_id, psu_type, sort_key, n_tracts, n_bg_hh,
+                TotHH, age18plus_hh,
+                age18_34_hh, age35_49_hh, age50_64_hh, age65plus_hh,
+                MOS_psu, pik_psu, selected_psu)
+write.csv(frame1, "~/Desktop/FRAME1_PSU.csv", row.names = FALSE)
+
+frame2 <- bg_sample_list %>%
+  dplyr::select(psu_id, bg_oper_id, n_bg_combined,
+                TotHH, age18plus, age18_34, age35_49, age50_64, age65plus,
+                MOS_bg_oper, pik_bg, selected_bg)
+write.csv(frame2, "~/Desktop/FRAME2_BG.csv", row.names = FALSE)
+
+# psu_type lives in psu_frame; bg_oper_type lives in bg_sample.
+# Join them in before selecting for output.
+sample_out <- sample_final %>%
+  left_join(psu_frame  %>% dplyr::select(psu_id, psu_type),
+            by = "psu_id") %>%
+  left_join(bg_sample  %>% dplyr::select(psu_id, bg_oper_id, bg_oper_type),
+            by = c("psu_id", "bg_oper_id")) %>%
+  dplyr::select(
+    psu_id, psu_type, bg_oper_id, 
+    TotHH, age18plus, age18_34, age35_49, age50_64, age65plus,
+    MOS_psu, pik_psu, MOS_bg_oper, pik_bg,
+    p3_18_34, p3_35_49, p3_50_64, p3_65plus,
+    p_overall_18_34, p_overall_35_49, p_overall_50_64, p_overall_65plus,
+    w_base_18_34, w_base_35_49, w_base_50_64, w_base_65plus,
+    hh_rate, exp_n_18_34, exp_n_35_49, exp_n_50_64, exp_n_65plus, exp_n_total,
+    takeall_18_34, takeall_35_49, takeall_50_64, takeall_65plus)
+write.csv(sample_out, "~/Desktop/SAMPLE.csv", row.names = FALSE)
+
+cat("FRAME1_PSU.csv:", nrow(frame1), "rows\n")
+cat("FRAME2_BG.csv :", nrow(frame2), "rows\n")
+cat("SAMPLE.csv    :", nrow(sample_out), "rows\n\n")
+
+cat("=== Sample preview ===\n")
+sample_out %>%
+  dplyr::select(psu_id, psu_type, bg_oper_id, 
+                TotHH, pik_psu, pik_bg,
+                hh_rate, w_base_18_34, exp_n_total) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  print(n = Inf)
+```
+
+```{r map-setup, message=FALSE, warning=FALSE}
+library(tigris)
+library(sf)
+library(leaflet)
+library(ggplot2)
+options(tigris_class    = "sf")
+options(tigris_use_cache = TRUE)
+
+# Download Wayne County shapefiles
+wayne_tracts <- tracts(state = "MI", county = "Wayne", year = 2020,
+                       progress_bar = FALSE)
+wayne_bgs    <- block_groups(state = "MI", county = "Wayne", year = 2020,
+                             progress_bar = FALSE)
+
+# Filter to Detroit only
+detroit_tracts_sf <- wayne_tracts %>%
+  right_join(tract_fips, by = "GEOID")
+
+detroit_bgs_sf <- wayne_bgs %>%
+  mutate(GEOIDt = substr(GEOID, 1, 11)) %>%
+  filter(GEOIDt %in% tract_fips$GEOID)
+
+# Project to WGS84
+detroit_tracts_trans <- st_transform(detroit_tracts_sf, 4326)
+detroit_bgs_trans    <- st_transform(detroit_bgs_sf,    4326)
+
+cat("Detroit tracts in shapefile:", nrow(detroit_tracts_trans), "\n")
+cat("Detroit BGs in shapefile:",    nrow(detroit_bgs_trans),    "\n")
+```
+
+```{r fig1-static, fig.cap="Figure 1: City of Detroit Census Tracts (solid) and Block Groups (dotted)"}
+ggplot() +
+  geom_sf(data  = detroit_bgs_trans,
+          fill      = NA,
+          linetype  = "dotted",
+          linewidth = 0.3,
+          color     = "grey50") +
+  geom_sf(data  = detroit_tracts_trans,
+          fill      = NA,
+          color     = "black",
+          linewidth  = 0.7) +
+  labs(title   = "Detroit Tracts (Solid) and Block Groups (Dotted)",
+       caption = "Source: 2020 Census TIGER/Line Shapefiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+```{r map-data-prep}
+# ---------------------------------------------------------------
+# FIX for 3-stage design:
+#
+# In 745_final_3stage.Rmd the relevant objects are:
+#   psu_map        -> maps tract_id to psu_id
+#   psu_sample     -> the 40 selected PSUs (has psu_id)
+#   bg_sample      -> the 40 selected BGs (has bg_oper_id, NOT bg_id directly)
+#   bg_in_sample_linked -> original bg_id rows with their bg_oper_id
+#
+# The GEOID column in tigris block_groups() is 12-digit (= original bg_id).
+# bg_oper_id may be "LBG_..." for linked BGs, which won't match tigris.
+# Solution: trace back from bg_sample$bg_oper_id to original bg_id(s)
+#           via bg_in_sample_linked, then match those to tigris GEOID.
+# ---------------------------------------------------------------
+
+# Step 1: selected PSU tract GEOIDs
+selected_tract_geoids <- psu_map %>%
+  filter(psu_id %in% psu_sample$psu_id) %>%
+  pull(tract_id)
+
+# Step 2: map selected bg_oper_ids back to original 12-digit bg_ids
+#   bg_in_sample_linked has columns: bg_id, bg_oper_id, psu_id
+selected_oper_ids <- bg_sample$bg_oper_id
+
+listing_bg_geoids <- bg_in_sample_linked %>%
+  filter(psu_id  %in% psu_sample$psu_id,
+         bg_oper_id %in% selected_oper_ids) %>%
+  pull(bg_id) %>%
+  unique()
+
+cat("Selected PSU tracts:", length(selected_tract_geoids), "\n")
+cat("Listing BG original GEOIDs:", length(listing_bg_geoids), "\n")
+
+# Mark flags on spatial data
+detroit_tracts_map <- detroit_tracts_trans %>%
+  mutate(selected_psu  = GEOID %in% selected_tract_geoids)
+
+detroit_bgs_map <- detroit_bgs_trans %>%
+  mutate(is_listing_bg = GEOID %in% listing_bg_geoids)
+
+selected_tracts_sf <- detroit_tracts_map %>% filter(selected_psu)
+listing_bgs_sf     <- detroit_bgs_map    %>% filter(is_listing_bg)
+
+cat("Tracts matched as selected:", nrow(selected_tracts_sf),
+    "(should be close to", length(selected_tract_geoids), ")\n")
+cat("BGs matched as listing:",     nrow(listing_bgs_sf),
+    "(may be > 40 if any listing BG spans a linked operational unit)\n")
+```
+
+```{r fig2-interactive, fig.cap="Figure 2: Selected Sample PSUs (blue) and Designated Listing Block Groups (red)"}
+leaflet() %>%
+  addTiles() %>%
+
+  # Base: all Detroit tracts
+  addPolygons(
+    data        = detroit_tracts_trans,
+    color       = "grey40",
+    weight      = 0.8,
+    fillOpacity = 0.0,
+    popup       = ~NAME,
+    group       = "All Tracts") %>%
+
+  # Selected PSUs (blue)
+  addPolygons(
+    data        = selected_tracts_sf,
+    color       = "blue",
+    weight      = 2,
+    fillColor   = "blue",
+    fillOpacity = 0.25,
+    popup       = ~paste0("<b>Selected PSU</b><br>GEOID: ", GEOID,
+                          "<br>", NAME),
+    group       = "Selected PSUs (Blue)") %>%
+
+  # Listing BGs (red)
+  addPolygons(
+    data        = listing_bgs_sf,
+    color       = "darkred",
+    weight      = 2,
+    fillColor   = "red",
+    fillOpacity = 0.70,
+    popup       = ~paste0("<b>Listing Block Group</b><br>GEOID: ", GEOID),
+    group       = "Listing BGs (Red)") %>%
+
+  addLayersControl(
+    overlayGroups = c("All Tracts",
+                      "Selected PSUs (Blue)",
+                      "Listing BGs (Red)"),
+    options = layersControlOptions(collapsed = FALSE)) %>%
+
+  addLegend(
+    position = "bottomright",
+    colors   = c("blue", "red"),
+    labels   = c("Selected PSU (Tract)", "Designated Listing BG"),
+    title    = "Sample Units",
+    opacity  = 0.8)
+```
